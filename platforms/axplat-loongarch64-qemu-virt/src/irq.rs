@@ -4,14 +4,48 @@ use loongArch64::register::{
     ticlr,
 };
 
-use crate::config::devices::{EIOINTC_IRQ, TIMER_IRQ};
+use crate::config::devices::{EIOINTC_IRQ, IPI_IRQ, TIMER_IRQ};
 
 // TODO: move these modules to a separate crate
 mod eiointc;
 mod pch_pic;
 
 /// The maximum number of IRQs.
-pub const MAX_IRQ_COUNT: usize = 12;
+pub const MAX_IRQ_COUNT: usize = 13;
+
+const IOCSR_IPI_SEND_CPU_SHIFT: u32 = 16;
+const IOCSR_IPI_SEND_BLOCKING: u32 = 1 << 31;
+
+const IOCSR_IPI_STATUS: u32 = 0x1000;
+const IOCSR_IPI_ENABLE: u32 = 0x1004;
+const IOCSR_IPI_CLEAR: u32 = 0x100c;
+const IOCSR_IPI_SEND: u32 = 0x1040;
+
+#[inline(always)]
+fn read_iocsr(reg: u32) -> u32 {
+    let val: u32;
+    unsafe {
+        core::arch::asm!(
+            "iocsrrd.w {}, {}",
+            out(reg) val,
+            in(reg) reg,
+            options(nostack, nomem)
+        );
+    }
+    val
+}
+
+#[inline(always)]
+fn write_iocsr(reg: u32, val: u32) {
+    unsafe {
+        core::arch::asm!(
+            "iocsrwr.w {}, {}",
+            in(reg) val,
+            in(reg) reg,
+            options(nostack)
+        );
+    }
+}
 
 static IRQ_HANDLER_TABLE: HandlerTable<MAX_IRQ_COUNT> = HandlerTable::new();
 
@@ -24,6 +58,7 @@ pub(crate) fn init() {
 enum IrqType {
     Timer,
     Io,
+    Ipi,
     Ex(usize),
 }
 
@@ -32,6 +67,7 @@ impl IrqType {
         match irq {
             TIMER_IRQ => Self::Timer,
             EIOINTC_IRQ => Self::Io,
+            IPI_IRQ => Self::Ipi,
             n => Self::Ex(n),
         }
     }
@@ -40,6 +76,7 @@ impl IrqType {
         match self {
             IrqType::Timer => TIMER_IRQ,
             IrqType::Io => EIOINTC_IRQ,
+            IrqType::Ipi => IPI_IRQ,
             IrqType::Ex(n) => *n,
         }
     }
@@ -52,15 +89,27 @@ impl IrqIf for IrqIfImpl {
     /// Enables or disables the given IRQ.
     fn set_enable(irq: usize, enabled: bool) {
         let irq = IrqType::new(irq);
-
         match irq {
-            IrqType::Timer => {
-                let old_value = ecfg::read().lie();
-                let new_value = match enabled {
-                    true => old_value | LineBasedInterrupt::TIMER,
-                    false => old_value & !LineBasedInterrupt::TIMER,
+            IrqType::Timer | IrqType::Ipi => {
+                let core_local_irq = match irq {
+                    IrqType::Timer => Some(LineBasedInterrupt::TIMER),
+                    IrqType::Ipi => {
+                        write_iocsr(IOCSR_IPI_ENABLE, u32::MAX);
+                        Some(LineBasedInterrupt::IPI)
+                    }
+                    _ => {
+                        warn!("unsupported IRQ type for core-local interrupt");
+                        None
+                    }
                 };
-                ecfg::set_lie(new_value);
+                if let Some(interrupt_bit) = core_local_irq {
+                    let old_value = ecfg::read().lie();
+                    let new_value = match enabled {
+                        true => old_value | interrupt_bit,
+                        false => old_value & !interrupt_bit,
+                    };
+                    ecfg::set_lie(new_value);
+                }
             }
             IrqType::Io => {}
             IrqType::Ex(irq) => {
@@ -121,6 +170,7 @@ impl IrqIf for IrqIfImpl {
             IrqType::Timer => {
                 ticlr::clear_timer_interrupt();
             }
+            IrqType::Ipi => write_iocsr(IOCSR_IPI_CLEAR, 0x1),
             IrqType::Io => {}
             IrqType::Ex(irq) => {
                 eiointc::complete_irq(irq);
@@ -131,7 +181,30 @@ impl IrqIf for IrqIfImpl {
     }
 
     /// Sends an inter-processor interrupt (IPI) to the specified target CPU or all CPUs.
-    fn send_ipi(_irq_num: usize, _target: IpiTarget) {
-        todo!()
+    fn send_ipi(_irq_num: usize, target: IpiTarget) {
+        match target {
+            IpiTarget::Current { cpu_id } => {
+                write_iocsr(
+                    IOCSR_IPI_SEND,
+                    (cpu_id as u32) << IOCSR_IPI_SEND_CPU_SHIFT | IOCSR_IPI_SEND_BLOCKING,
+                );
+            }
+            IpiTarget::Other { cpu_id } => {
+                write_iocsr(
+                    IOCSR_IPI_SEND,
+                    (cpu_id as u32) << IOCSR_IPI_SEND_CPU_SHIFT | IOCSR_IPI_SEND_BLOCKING,
+                );
+            }
+            IpiTarget::AllExceptCurrent { cpu_id, cpu_num } => {
+                for i in 0..cpu_num {
+                    if i != cpu_id {
+                        write_iocsr(
+                            IOCSR_IPI_SEND,
+                            (i as u32) << IOCSR_IPI_SEND_CPU_SHIFT | IOCSR_IPI_SEND_BLOCKING,
+                        );
+                    }
+                }
+            }
+        }
     }
 }
