@@ -194,6 +194,9 @@ impl IrqIf for IrqIfImpl {
                     // SAFETY: The handler is guaranteed to be a valid function pointer.
                     unsafe { core::mem::transmute::<*mut (), IrqHandler>(handler)(irq) };
                 }
+                unsafe {
+                    riscv::register::sip::clear_ssoft();
+                }
             },
             @S_EXT => {
                 let Some(irq) = PLIC.claim(this_context()) else {
